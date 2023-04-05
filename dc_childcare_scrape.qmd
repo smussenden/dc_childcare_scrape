@@ -1,0 +1,380 @@
+---
+title: "dc_childcare_scrape"
+format: html
+editor: visual
+---
+```{r}
+###
+# Load libraries
+###
+
+library(rvest)
+library(tidyverse)
+library(janitor)
+library(purrr)
+library(future)
+library(furrr)
+library(gmapsdistance)
+library(ggmap)
+library(units)
+library(measurements)
+ggmap::register_google("AIzaSyA2tx5KaNahG9SqjCAM1Wxs0qIw2khbis8")
+gmapsdistance::set.api.key("AIzaSyA2tx5KaNahG9SqjCAM1Wxs0qIw2khbis8")
+
+
+###
+# Define email functions
+###
+
+decode_cf_email <- function(encoded_email) {
+  email_key <- strtoi(substr(encoded_email, 1, 2), 16L)
+  encoded_chars <- strsplit(substr(encoded_email, 3, nchar(encoded_email)), "")[[1]]
+  
+  decoded_chars <- sapply(seq(1, length(encoded_chars), by = 2), function(i) {
+    char_code <- strtoi(paste0(encoded_chars[i], encoded_chars[i+1]), 16L)
+    rawToChar(as.raw(bitwXor(char_code, email_key)))
+  })
+  
+  paste(decoded_chars, collapse = "")
+}
+
+###
+# Define email functions
+###
+
+get_facility_details <- function(facility_id) {
+  
+
+###
+# ingest html
+###
+
+
+html_content <- paste0("https://mychildcare.dc.gov/MychildCare/FacilityProfile?FacilityId=",facility_id)
+
+# Read the HTML content with rvest
+page <- read_html(html_content)
+
+####################
+# Extract elements
+####################
+
+###
+# Facility details
+###
+
+# facility name
+facility_name <- page %>% html_node(".ProximaSoft-Semibold") %>% html_text()
+
+# address
+address <- page %>% 
+  html_nodes(xpath = '//span[@style="margin-left:15px;font-family:Helvetica;font-size:15pt"]') %>% .[[1]] %>% 
+  html_text()
+
+# facility type
+facility_type <- page %>% html_nodes(xpath = '//span[contains(img/@src, "facilitytype.png")]') %>% html_text()
+
+
+# contact
+contact <- page %>%
+  html_nodes(xpath = '//span[contains(text(), "Contact:")]') %>%
+  html_text(trim = TRUE) %>%
+  gsub("Contact:\\s*", "", .)
+
+# phone
+phone <- page %>% html_node(xpath = '//img[@alt="Phone"]/following-sibling::text()') %>% html_text(trim = TRUE)
+
+# website
+website <- page %>% html_nodes(xpath = '//span[contains(img/@src, "website.png")]') %>% html_text()
+
+###
+# Email contact
+###
+
+# Extract the encoded email string
+encoded_email <- page %>% 
+  html_node(".__cf_email__") %>% 
+  html_attr("data-cfemail")
+
+# Decode the email address
+email <- decode_cf_email(encoded_email)
+
+
+###
+# Facility Hours
+###
+
+# Service schedule
+facility_hours <- page %>%
+  html_nodes(xpath = '//div[contains(., "Service Schedule")]/table') %>% 
+  html_table(fill = TRUE)
+
+facility_hours <- facility_hours[2][[1]] %>%
+  rename(day=X1,
+         hours=X2)
+
+# Create a character vector by concatenating the 'day' and 'hours' columns
+facility_hours <- paste(facility_hours$day, facility_hours$hours, sep = " ")
+
+# Collapse the character list into a single string separated by semi-colons
+facility_hours <- paste(facility_hours, collapse = "; ")
+
+###
+# At a glance details
+###
+
+capital_quality_designation <- page %>% html_node(xpath = '//span[@style="font-size:12pt"]') %>% html_text()
+
+
+language_spoken <- page %>% html_node(xpath = '/html/body/div[2]/div[1]/div[2]/table/tbody/tr[3]/td[1]/span[2]') %>% html_text()
+
+
+other_languages <- page %>% html_node(xpath = '/html/body/div[2]/div[1]/div[2]/table/tbody/tr[3]/td[3]/span[2]') %>% html_text()
+
+facility_capacity <- page %>% html_node(xpath = '/html/body/div[2]/div[1]/div[2]/table/tbody/tr[3]/td[4]/span[2]') %>% html_text()
+
+accreditation <- page %>% html_node(xpath = '/html/body/div[2]/div[1]/div[2]/table/tbody/tr[5]/td[1]/span[2]') %>% html_text()
+
+accepts_vouchers <- page %>% html_node(xpath = '/html/body/div[2]/div[1]/div[2]/table/tbody/tr[5]/td[4]/span[2]') %>% html_text()
+
+##########
+# Tables
+##########
+
+###
+# Age served table
+###
+
+# extract the table of ages served
+ages_served_table <- page %>% 
+  html_nodes(xpath = '//div[@class="panel-body"]/div[@class="row"]/div[@class="col-sm-12"]/table') %>% 
+  .[[2]]
+
+# extract the rows of the table
+age_rows <- ages_served_table %>% 
+  html_nodes("tr")
+
+# extract the age range and whether it's served
+age_range <- age_rows %>% 
+  html_nodes("td:nth-child(1)") %>% 
+  html_text()
+
+served <- age_rows %>% 
+  html_nodes("td:nth-child(2)") %>% 
+  html_text()
+
+# combine the age range and whether it's served into a single list
+ages_served <- paste(age_range, served, sep = " - ")
+
+# Collapse the character list into a single string separated by semi-colons
+ages_served <- paste(ages_served, collapse = "; ")
+
+###
+# Enrollment and openings
+###
+
+enrollment_and_openings <- page %>%
+  html_table()
+
+enrollment_and_openings <- enrollment_and_openings[[7]] %>%
+  row_to_names(1) %>%
+  clean_names() %>%
+  mutate(facility_id = facility_id) %>%
+  select(facility_id,everything())
+
+###
+# Build tibble
+###
+  
+# Create a tibble (data frame) to store the extracted information
+result <- tibble(
+  facility_name = facility_name,
+  facility_type = facility_type,
+  address = address,
+  contact = contact,
+  phone = phone,
+  email = email,
+  website = website,
+  facility_hours = facility_hours,
+  capital_quality_designation = capital_quality_designation,
+  ages_served = ages_served,
+  language_spoken = language_spoken,
+  other_languages = other_languages,
+  facility_capacity = facility_capacity,
+  accreditation = accreditation,
+  accepts_vouchers = accepts_vouchers,
+  enrollment_and_openings = list(enrollment_and_openings)
+)
+
+}
+
+###
+# Build a list of facilities
+###
+
+list_facilities <- read_html("https://mychildcare.dc.gov/Home/SearchFacilities") %>%
+  html_nodes('table a') %>%
+  html_attr("id") %>%
+  str_remove_all("name_")
+
+###
+# loop
+###
+
+plan(multisession, workers = 30)
+
+facilities <- future_map_dfr(list_facilities,get_facility_details)
+
+###
+# Establish geocoded locations for mapping
+###
+# home
+home <- geocode("1316 Staples Street NE, Washington, DC 20002") %>%
+  mutate(lat_lon = paste0(lat," ",lon))
+
+home <- home$lat_lon
+
+# sean work
+sean_work <- geocode("7765 Alumni Drive, College Park, Maryland 20742") %>%
+  mutate(lat_lon = paste0(lat," ",lon))
+
+sean_work <- sean_work$lat_lon
+
+# jules work
+jules_work <- geocode("1350 Pennsylvania Avenue NW, Washington, DC 20004") %>%
+  mutate(lat_lon = paste0(lat," ",lon))
+
+jules_work <- jules_work$lat_lon
+
+###
+# geocode
+###
+
+facilities_x <- facilities %>%
+  separate(ages_served, into=c("infant_0_12","toddler_12_36","preschool_36_plus","school"), sep=";") %>%
+  filter(str_detect(infant_0_12,"Yes")) %>%
+#  filter(str_detect(facility_type,"Child Development Center")) %>%
+#  filter(str_detect(address,"NE"))
+  mutate(address_coordinates = geocode(address)) 
+  
+facilities_y <- facilities_x %>%  
+  mutate(lat_lon = paste0(address_coordinates$lat," ",address_coordinates$lon)) %>%
+  rowwise() %>%
+  mutate(distance_home = list(gmapsdistance(
+    origin = home,
+    destination = lat_lon
+  ))) %>%
+  mutate(distance_sean = list(gmapsdistance(
+    origin = sean_work,
+    destination = lat_lon
+  ))) %>%
+  mutate(distance_jules = list(gmapsdistance(
+    origin = jules_work,
+    destination = lat_lon
+  ))) %>%  
+  #select(-address_coordinates) %>%
+  #select(-pull(address_coordinates, lon), -pull(address_coordinates, lat)) %>%
+  unnest_wider(distance_home) %>%
+  clean_names() %>%
+  mutate(home_miles = round(conv_unit(distance,"m","mi"),1)) %>%
+  mutate(home_minutes = round(time/60,1)) %>%
+  select(-distance,-time,-status) %>%
+  unnest_wider(distance_sean) %>%
+  clean_names() %>%
+  mutate(sean_miles = round(conv_unit(distance,"m","mi"),1)) %>%
+  mutate(sean_minutes = round(time/60,1)) %>%
+  select(-distance,-time,-status) %>%
+  unnest_wider(distance_jules) %>%
+  clean_names() %>%
+  mutate(jules_miles = round(conv_unit(distance,"m","mi"),1)) %>%
+  mutate(jules_minutes = round(time/60,1)) %>%
+  select(-distance,-time,-status) 
+
+sean_commute <- gmapsdistance(
+    origin = home,
+    destination = sean_work
+  ) %>%
+    as_tibble() %>%
+  clean_names() %>%
+  mutate(home_miles = round(conv_unit(distance,"m","mi"),1)) %>%
+  mutate(home_minutes = round(time/60,1)) %>%
+  select(-distance,-time,-status) 
+
+sean_commute_minutes <- sean_commute$home_minutes
+sean_commute_miles <- sean_commute$home_miles  
+
+sean_commute <- gmapsdistance(
+    origin = home,
+    destination = sean_work
+  ) %>%
+    as_tibble() %>%
+  clean_names() %>%
+  mutate(home_miles = round(conv_unit(distance,"m","mi"),1)) %>%
+  mutate(home_minutes = round(time/60,1)) %>%
+  select(-distance,-time,-status) 
+
+sean_commute_minutes <- sean_commute$home_minutes
+sean_commute_miles <- sean_commute$home_miles  
+
+
+jules_commute <- gmapsdistance(
+    origin = home,
+    destination = jules_work
+  ) %>%
+  as_tibble() %>%
+  clean_names() %>%
+  mutate(home_miles = round(conv_unit(distance,"m","mi"),1)) %>%
+  mutate(home_minutes = round(time/60,1)) %>%
+  select(-distance,-time,-status) 
+
+jules_commute_minutes <- jules_commute$home_minutes
+jules_commute_miles <- jules_commute$home_miles  
+
+facilities_z <- facilities_y %>%
+  mutate(jules_drop_to_work_time = jules_minutes+home_minutes) %>%
+  mutate(sean_drop_to_work_time = sean_minutes+home_minutes) %>%
+  mutate(jules_added_minutes = jules_drop_to_work_time - jules_commute_minutes) %>%
+  mutate(sean_added_minutes = sean_drop_to_work_time - sean_commute_minutes) %>%
+  mutate(dropoff = case_when(
+    jules_drop_to_work_time <= sean_drop_to_work_time ~ "jules",
+    TRUE ~ "sean"
+  )) %>%  
+  mutate(shortest_drop_to_work_time = case_when(
+    jules_drop_to_work_time <= sean_drop_to_work_time ~ jules_drop_to_work_time,
+    TRUE ~ sean_drop_to_work_time
+  )) %>%  
+  mutate(added_minutes = case_when(
+    dropoff == "jules" ~ jules_added_minutes,
+    TRUE ~ sean_added_minutes
+  )) %>%
+  select(facility_name,dropoff:added_minutes,everything()) %>%
+  arrange(dropoff,added_minutes) %>%
+  #filter(str_detect(facility_type,"Child Development Center")) %>%
+  arrange(added_minutes) %>%
+  select(-address_coordinates,-enrollment_and_openings,-website,-preschool_36_plus,-school,-language_spoken,-accreditation,-other_languages) %>%
+  select(facility_name:facility_capacity) %>%
+  mutate(facility_type = str_remove_all(facility_type,"Facility Type:")) %>%
+  mutate(infant_0_12 =  case_when(
+    str_detect(infant_0_12, "Yes") ~ "Yes",
+    TRUE ~ "No"
+  )) %>%
+  mutate(toddler_12_36 =  case_when(
+    str_detect(toddler_12_36, "Yes") ~ "Yes",
+    TRUE ~ "No"
+  ))
+
+
+
+library(googlesheets4)
+sheet_write(facilities_z, "https://docs.google.com/spreadsheets/d/1jt6JjFhM3K8Pyervyd8Ipo_V5rXR3kEEAIZ7RybO6j8/edit#gid=0", sheet="all_infant")
+sheet_write(facilities_z %>% filter(str_detect(facility_type,"CDC")), "https://docs.google.com/spreadsheets/d/1jt6JjFhM3K8Pyervyd8Ipo_V5rXR3kEEAIZ7RybO6j8/edit#gid=0", sheet="centers")
+sheet_write(facilities_z %>% filter(str_detect(facility_type,"CDX")), "https://docs.google.com/spreadsheets/d/1jt6JjFhM3K8Pyervyd8Ipo_V5rXR3kEEAIZ7RybO6j8/edit#gid=0", sheet="home_expanded")
+sheet_write(facilities_z %>% filter(str_detect(facility_type,"CDH")), "https://docs.google.com/spreadsheets/d/1jt6JjFhM3K8Pyervyd8Ipo_V5rXR3kEEAIZ7RybO6j8/edit#gid=0", sheet="home")
+
+
+
+  filter(str_detect(ages_served,"Infant (0 - 12 months) - Yes;"))
+
+enrollment_and_tuition_table <- unnest(facilities, cols = enrollment_and_openings)
+
+```
